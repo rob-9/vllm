@@ -972,7 +972,7 @@ def _build_decode_inputs(
     "seq_lens_list",
     [(130, 257), (129, 200, 384)],
 )
-@pytest.mark.parametrize("decode_query_len", [1, 4])
+@pytest.mark.parametrize("decode_query_len", [1, 4, 8])
 @pytest.mark.parametrize("num_padded_reqs", [0, 2])
 def test_decode_sparse_attention_correctness(
     kv_layout: str,
