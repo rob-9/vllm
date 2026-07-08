@@ -413,6 +413,289 @@ def _merge_topk_attn_out_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Union-based decode kernel for multi-token verify (spec-decode).
+# Loads each KV block from HBM once per request, amortizing across all draft
+# positions that selected it.
+# ---------------------------------------------------------------------------
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_H": lambda args: max(
+            16, triton.next_power_of_2(args["gqa_group_size"])
+        ),
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    }
+)
+@triton.jit
+def _gqa_sparse_decode_union_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    kv_cache_ptr,  # [num_blocks, 2, 128, num_kv_heads, head_dim]
+    union_ptr,  # [num_kv_heads, num_requests, max_union_size] int32
+    union_mask_ptr,  # [num_kv_heads, num_requests, max_union_size] int16
+    union_lens_ptr,  # [num_kv_heads, num_requests] int32
+    o_ptr,  # [NUM_UNION_CHUNKS, total_q, num_heads, head_dim]
+    lse_ptr,  # [NUM_UNION_CHUNKS, total_q, num_heads] float32
+    block_table_ptr,  # [num_reqs, max_blocks]
+    seq_lens,  # [num_reqs] int32
+    num_requests,
+    gqa_group_size,
+    head_dim,
+    max_union_size,
+    sm_scale,
+    decode_query_len,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_kv,
+    stride_kv_pos,
+    stride_kv_h,
+    stride_kv_d,
+    stride_u_h,
+    stride_u_r,
+    stride_u_b,
+    stride_um_h,
+    stride_um_r,
+    stride_um_b,
+    stride_ul_h,
+    stride_ul_r,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,  # == 128
+    NUM_UNION_CHUNKS: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    DECODE_QUERY_LEN: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_rc, pid_kh = tl.program_id(0), tl.program_id(1)
+    req_id = pid_rc % num_requests
+    chunk_id = pid_rc // num_requests
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    seq_len = tl.load(seq_lens + req_id)
+    union_len = tl.load(
+        union_lens_ptr + pid_kh * stride_ul_h + req_id * stride_ul_r
+    )
+
+    chunk_size = (max_union_size + NUM_UNION_CHUNKS - 1) // NUM_UNION_CHUNKS
+    chunk_start = chunk_id * chunk_size
+    chunk_end_compiletime = chunk_start + chunk_size
+    chunk_end = tl.minimum(chunk_end_compiletime, union_len)
+
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    d_mask = off_d < head_dim
+    bt_row = block_table_ptr + req_id * stride_bt_b
+    pid_h = pid_kh * gqa_group_size
+
+    q_base = req_id * decode_query_len
+
+    m_i = tl.full((DECODE_QUERY_LEN, BLOCK_SIZE_H), float("-inf"), tl.float32)
+    lse_i = tl.full((DECODE_QUERY_LEN, BLOCK_SIZE_H), float("-inf"), tl.float32)
+    acc_o = tl.zeros((DECODE_QUERY_LEN, BLOCK_SIZE_H, BLOCK_SIZE_D), tl.float32)
+
+    q_all = tl.zeros(
+        (DECODE_QUERY_LEN, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        dtype=q_ptr.dtype.element_ty,
+    )
+    for pos_j in tl.static_range(DECODE_QUERY_LEN):
+        q_ptrs = tl.make_block_ptr(
+            base=q_ptr + (q_base + pos_j) * stride_qn + pid_h * stride_qh,
+            shape=(gqa_group_size, head_dim),
+            strides=(stride_qh, stride_qd),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
+        q_all[pos_j] = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+
+    union_base = union_ptr + pid_kh * stride_u_h + req_id * stride_u_r
+    mask_base = union_mask_ptr + pid_kh * stride_um_h + req_id * stride_um_r
+
+    for block_i in tl.range(chunk_start, chunk_end):
+        blk = tl.load(union_base + block_i * stride_u_b).to(tl.int32)
+        mask_bits = tl.load(mask_base + block_i * stride_um_b).to(tl.int32)
+
+        if blk < 0:
+            continue
+
+        page = tl.load(bt_row + blk).to(tl.int64)
+        c = blk * BLOCK_SIZE_K
+        pos = c + off_n
+        pos_mask = pos < seq_len
+
+        k = tl.load(
+            kv_cache_ptr
+            + page * stride_kv_blk
+            + 0 * stride_kv_kv
+            + off_n[None, :] * stride_kv_pos
+            + pid_kh * stride_kv_h
+            + off_d[:, None] * stride_kv_d,
+            mask=d_mask[:, None] & pos_mask[None, :],
+            other=0.0,
+        )
+        if USE_FP8:
+            k = k.to(q_ptr.dtype.element_ty)
+
+        v = tl.load(
+            kv_cache_ptr
+            + page * stride_kv_blk
+            + 1 * stride_kv_kv
+            + off_n[:, None] * stride_kv_pos
+            + pid_kh * stride_kv_h
+            + off_d[None, :] * stride_kv_d,
+            mask=pos_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        if USE_FP8:
+            v = v.to(q_ptr.dtype.element_ty)
+
+        for pos_j in tl.static_range(DECODE_QUERY_LEN):
+            if mask_bits & (1 << pos_j):
+                q_j = q_all[pos_j]
+                query_pos = seq_len - decode_query_len + pos_j
+                kv_len = tl.maximum(query_pos + 1, 0)
+
+                qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+                causal_mask = pos < kv_len
+                qk += tl.where(
+                    pos_mask[None, :] & causal_mask[None, :], 0, float("-inf")
+                )
+                qk += tl.dot(q_j, k) * sm_scale_log2e
+
+                m_ij = tl.maximum(m_i[pos_j], tl.max(qk, axis=1))
+                p = tl.exp2(qk - m_ij[:, None])
+                l_ij = tl.sum(p, axis=1)
+                acc_o[pos_j] = (
+                    acc_o[pos_j] * tl.exp2(m_i[pos_j] - m_ij)[:, None]
+                )
+                acc_o[pos_j] = acc_o[pos_j] + tl.dot(p.to(v.dtype), v)
+                m_i[pos_j] = m_ij
+                lse_i[pos_j] = m_ij + tl.log2(
+                    tl.exp2(lse_i[pos_j] - m_ij) + l_ij
+                )
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # store partials
+    for pos_j in tl.static_range(DECODE_QUERY_LEN):
+        token_idx = q_base + pos_j
+        scale = tl.where(
+            lse_i[pos_j] > float("-inf"),
+            tl.exp2(m_i[pos_j] - lse_i[pos_j]),
+            tl.zeros_like(lse_i[pos_j]),
+        )
+        out = acc_o[pos_j] * scale[:, None]
+        o_ptrs = tl.make_block_ptr(
+            base=o_ptr
+            + chunk_id * stride_o_c
+            + token_idx * stride_o_b
+            + pid_h * stride_o_h,
+            shape=(gqa_group_size, head_dim),
+            strides=(stride_o_h, stride_o_d),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
+        tl.store(o_ptrs, out.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
+        lse_ptrs = tl.make_block_ptr(
+            base=lse_ptr
+            + chunk_id * stride_l_c
+            + token_idx * stride_l_b
+            + pid_h * stride_l_h,
+            shape=(gqa_group_size,),
+            strides=(stride_l_h,),
+            offsets=(0,),
+            block_shape=(BLOCK_SIZE_H,),
+            order=(0,),
+        )
+        tl.store(
+            lse_ptrs,
+            lse_i[pos_j].to(lse_ptr.dtype.element_ty),
+            boundary_check=(0,),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Union precomputation for multi-token decode (spec-decode verify)
+# ---------------------------------------------------------------------------
+
+
+def _precompute_union_blocks(
+    topk_idx: torch.Tensor,
+    num_requests: int,
+    decode_query_len: int,
+    num_kv_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """deduplicate top-k block selections across draft positions per request.
+
+    Args:
+        topk_idx: [num_kv_heads, total_q, topk] int32 block indices
+        num_requests: number of requests in batch
+        decode_query_len: tokens per request (uniform)
+        num_kv_heads: number of KV heads
+
+    Returns:
+        union_blocks: [num_kv_heads, num_requests, max_union_size] int32
+            deduplicated sorted block indices, padded with -1
+        union_mask: [num_kv_heads, num_requests, max_union_size] int16
+            bitmask — bit j set means position j selected this block
+        union_lens: [num_kv_heads, num_requests] int32
+            actual union size per (head, request)
+    """
+    topk = topk_idx.shape[-1]
+    max_union_size = decode_query_len * topk
+    device = topk_idx.device
+
+    idx = topk_idx.view(num_kv_heads, num_requests, decode_query_len, topk)
+    flat = idx.reshape(num_kv_heads, num_requests, max_union_size)
+
+    sorted_flat, sort_order = flat.sort(dim=-1)
+
+    # mark first occurrence of each unique value
+    first_mask = torch.ones_like(sorted_flat, dtype=torch.bool)
+    first_mask[..., 1:] = sorted_flat[..., 1:] != sorted_flat[..., :-1]
+
+    union_lens = first_mask.sum(dim=-1, dtype=torch.int32)
+    dest_idx = first_mask.cumsum(dim=-1) - 1
+
+    union_blocks = torch.full(
+        (num_kv_heads, num_requests, max_union_size),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    union_mask = torch.zeros(
+        (num_kv_heads, num_requests, max_union_size),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    union_blocks.scatter_(2, dest_idx, sorted_flat)
+
+    # build bitmask: bit j set if position j's topk contained this block
+    pos_ids = (
+        torch.arange(max_union_size, device=device) // topk
+    ).expand_as(flat)
+    bit_vals = (1 << pos_ids).to(torch.int16)
+    bit_vals_sorted = bit_vals.gather(2, sort_order)
+    union_mask.scatter_add_(2, dest_idx, bit_vals_sorted)
+
+    return union_blocks, union_mask, union_lens
+
+
+# ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
 @torch.no_grad()
@@ -497,8 +780,115 @@ def minimax_m3_sparse_attn_decode(
     # launch_pdl was specified but unrecognised"). Only pass it when PDL is
     # actually supported -- on ROCm use_pdl is always False, so it's omitted.
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
-    # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
+
     TARGET_GRID = 256
+    num_requests = seq_lens.shape[0]
+
+    if decode_query_len > 1:
+        assert decode_query_len <= 16, "union bitmask is int16"
+        union_blocks, union_mask, union_lens = _precompute_union_blocks(
+            topk_idx, num_requests, decode_query_len, num_kv_heads
+        )
+        max_union_size = decode_query_len * max_topk
+
+        # split-K chunk count over union blocks (shape-constant for cuda graph)
+        target = max(
+            1,
+            min(
+                max_union_size,
+                TARGET_GRID // max(1, num_requests * num_kv_heads),
+            ),
+        )
+        num_union_chunks = 1 << (target.bit_length() - 1)
+
+        o_partial = torch.empty(
+            num_union_chunks,
+            total_q,
+            num_heads,
+            head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        lse_partial = torch.empty(
+            num_union_chunks,
+            total_q,
+            num_heads,
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+        grid = (num_requests * num_union_chunks, num_kv_heads)
+        _gqa_sparse_decode_union_kernel[grid](
+            q,
+            kv_cache,
+            union_blocks,
+            union_mask,
+            union_lens,
+            o_partial,
+            lse_partial,
+            block_table,
+            seq_lens,
+            num_requests,
+            gqa_group_size,
+            head_dim,
+            max_union_size,
+            sm_scale,
+            decode_query_len,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            kv_cache.stride(4),
+            union_blocks.stride(0),
+            union_blocks.stride(1),
+            union_blocks.stride(2),
+            union_mask.stride(0),
+            union_mask.stride(1),
+            union_mask.stride(2),
+            union_lens.stride(0),
+            union_lens.stride(1),
+            o_partial.stride(0),
+            o_partial.stride(1),
+            o_partial.stride(2),
+            o_partial.stride(3),
+            lse_partial.stride(0),
+            lse_partial.stride(1),
+            lse_partial.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            NUM_UNION_CHUNKS=num_union_chunks,
+            DECODE_QUERY_LEN=decode_query_len,
+            USE_FP8=use_fp8,
+            USE_PDL=use_pdl,
+            **pdl_launch,
+        )
+
+        merge_grid = (total_q, num_heads)
+        _merge_topk_attn_out_kernel[merge_grid](
+            o_partial,
+            lse_partial,
+            output,
+            head_dim,
+            o_partial.stride(0),
+            o_partial.stride(1),
+            o_partial.stride(2),
+            o_partial.stride(3),
+            lse_partial.stride(0),
+            lse_partial.stride(1),
+            lse_partial.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            NUM_TOPK_CHUNKS=num_union_chunks,
+            USE_PDL=use_pdl,
+            **pdl_launch,
+        )
+        return
+
+    # existing single-token decode path (decode_query_len == 1)
     target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
     num_topk_chunks = 1 << (target.bit_length() - 1)
     o_partial = torch.empty(
