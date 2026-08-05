@@ -113,7 +113,7 @@ EMPTY_STREAMING = {
 NEW_LINE = {
     "output": "\n<think>This is a reasoning section</think>\nThis is the rest",
     "reasoning": "This is a reasoning section",
-    "content": "This is the rest",
+    "content": "\nThis is the rest",
     "is_reasoning_end": True,
 }
 
@@ -308,15 +308,14 @@ def test_reasoning(
     # Test extract_content
     if param_dict["content"] is not None:
         content = parser.extract_content_ids(output_ids)
-        # Fixed expected token ids for specific test cases
         test_id = (
             request.node.callspec.id if hasattr(request.node, "callspec") else None
         )
-        # Match most specific first
+        # extract_content_ids returns the ids after </think>, so it cannot match
+        # an expected content that also covers text from outside that span.
         if test_id not in [
             "new_line_streaming_complex_content",
             "new_line_streaming",
-            "new_line",
             "multi_turn_prompt_content",
         ]:
             expected_content_ids = step3p5_tokenizer.convert_tokens_to_ids(
@@ -326,6 +325,39 @@ def test_reasoning(
     else:
         content = parser.extract_content_ids(output)
         assert content == []
+
+
+@pytest.mark.parametrize(
+    "output, expected_reasoning, expected_content",
+    [
+        # Prefix preserved, with no newlines involved.
+        ("Intro<think>reasoning</think>Answer", "reasoning", "IntroAnswer"),
+        # The newline trimmed is the one after </think>, not the one that
+        # happens to lead the preserved prefix.
+        (
+            "\nIntro<think>reasoning\n</think>\nAnswer",
+            "reasoning",
+            "\nIntroAnswer",
+        ),
+        # Prefix is still content when the model never closes the reasoning.
+        ("Intro<think>reasoning", "reasoning", "Intro"),
+    ],
+)
+def test_step3p5_keeps_text_before_think(
+    step3p5_tokenizer, output, expected_reasoning, expected_content
+):
+    """Text emitted before <think> is content and must survive the newline trims.
+
+    Regression test for the newline trims landing on the preserved prefix
+    instead of on the text following </think>.
+    """
+    parser_cls = ReasoningParserManager.get_reasoning_parser("step3p5")
+    parser = parser_cls(step3p5_tokenizer)
+
+    reasoning, content = run_reasoning_extraction(parser, [output], streaming=False)
+
+    assert reasoning == expected_reasoning
+    assert content == expected_content
 
 
 def test_step3p5_streaming_drops_leading_newline(step3p5_tokenizer):

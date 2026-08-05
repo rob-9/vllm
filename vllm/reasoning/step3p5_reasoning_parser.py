@@ -21,6 +21,10 @@ class Step3p5ReasoningParser(BaseThinkingReasoningParser):
     newline immediately before and/or after the </think> token. This parser trims:
       - the newline right before </think>
       - the newline right after </think>
+
+    Text emitted before <think> is content, not reasoning, and is preserved
+    as-is. The trims above apply only around </think>, so they must not be
+    applied to that leading text.
     """
 
     @property
@@ -97,11 +101,25 @@ class Step3p5ReasoningParser(BaseThinkingReasoningParser):
         model_output: str,
         request: "ChatCompletionRequest | ResponsesRequest",
     ) -> tuple[str | None, str | None]:
-        reasoning, content = super().extract_reasoning(model_output, request)
+        # Split off the text before <think> ourselves so the newline trims below
+        # apply to the text around </think> rather than to that prefix. The
+        # start token is put back because the base re-partitions on the first one
+        # it finds, and passing the bare tail would re-anchor it to a later
+        # <think> block.
+        content_before = ""
+
+        if self.start_token in model_output:
+            content_before, _, after_start = model_output.partition(self.start_token)
+            model_output = self.start_token + after_start
+
+        reasoning, content_after = super().extract_reasoning(model_output, request)
+
         if reasoning is not None:
             reasoning = reasoning.removesuffix("\n")
-        if content is not None:
-            content = content.removeprefix("\n")
+        if content_after is not None:
+            content_after = content_after.removeprefix("\n")
+
+        content = content_before + (content_after or "")
         return reasoning or None, content or None
 
     def extract_reasoning_streaming(
