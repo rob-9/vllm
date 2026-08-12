@@ -122,6 +122,24 @@ def test_request_logger_log_outputs_with_truncation():
         assert len(logged_token_ids) == 10
 
 
+def test_request_logger_preserves_token_id_sequence_without_truncation():
+    mock_logger = MagicMock()
+
+    with patch("vllm.entrypoints.serve.utils.request_logger.logger", mock_logger):
+        request_logger = RequestLogger(max_log_len=None)
+        output_token_ids = (1, 2, 3)
+
+        request_logger.log_outputs(
+            request_id="test-no-truncate",
+            outputs="Test output",
+            output_token_ids=output_token_ids,
+            finish_reason="stop",
+        )
+
+        call_args = mock_logger.info.call_args.args
+        assert call_args[4] is output_token_ids
+
+
 def test_request_logger_log_outputs_none_values():
     """Test log_outputs handles None values correctly."""
     mock_logger = MagicMock()
@@ -146,6 +164,32 @@ def test_request_logger_log_outputs_none_values():
         assert call_args[3] == "Test output"
         assert call_args[4] is None
         assert call_args[5] == "stop"
+
+
+def test_request_logger_omits_output_token_ids_when_disabled():
+    """Test log_outputs omits the output_token_ids field entirely when
+    enable_log_output_token_ids is False."""
+    mock_logger = MagicMock()
+
+    with patch("vllm.entrypoints.serve.utils.request_logger.logger", mock_logger):
+        request_logger = RequestLogger(
+            max_log_len=None,
+            enable_log_output_token_ids=False,
+        )
+
+        request_logger.log_outputs(
+            request_id="test-no-token-ids",
+            outputs="Test output",
+            output_token_ids=[1, 2, 3],
+            finish_reason="stop",
+        )
+
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args.args
+        assert "output_token_ids" not in call_args[0]
+        assert call_args[1] == "test-no-token-ids"
+        assert call_args[3] == "Test output"
+        assert call_args[4] == "stop"
 
 
 def test_request_logger_log_outputs_empty_output():

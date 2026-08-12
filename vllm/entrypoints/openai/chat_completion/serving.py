@@ -680,7 +680,11 @@ class OpenAIServingChat(GenerateBaseServing):
                             self.request_logger.log_outputs(
                                 request_id=request_id,
                                 outputs=delta_content,
-                                output_token_ids=as_list(output.token_ids),
+                                output_token_ids=(
+                                    as_list(output.token_ids)
+                                    if self.request_logger.enable_log_output_token_ids
+                                    else None
+                                ),
                                 finish_reason=output.finish_reason,
                                 is_streaming=True,
                                 delta=True,
@@ -1126,7 +1130,10 @@ class OpenAIServingChat(GenerateBaseServing):
                 if output_text:
                     # Get the corresponding output token IDs
                     output_token_ids = None
-                    if choice.index < len(final_res.outputs):
+                    if (
+                        self.request_logger.enable_log_output_token_ids
+                        and choice.index < len(final_res.outputs)
+                    ):
                         output_token_ids = final_res.outputs[choice.index].token_ids
 
                     self.request_logger.log_outputs(

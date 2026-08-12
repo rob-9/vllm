@@ -96,6 +96,30 @@ def test_serialize_message_pydantic_model_returns_dict() -> None:
     assert serialized["message"] == "hello"
 
 
+def test_response_output_logging_omits_token_ids_when_disabled() -> None:
+    serving = OpenAIServingResponses.__new__(OpenAIServingResponses)
+    serving.enable_log_outputs = True
+    serving.request_logger = MagicMock()
+    serving.request_logger.enable_log_output_token_ids = False
+
+    output_items = serving._make_response_output_items(
+        request=ResponsesRequest(input="Test prompt"),
+        final_output=CompletionOutput(
+            index=0,
+            text="Test output",
+            token_ids=[100, 101],
+            cumulative_logprob=None,
+            logprobs=None,
+            finish_reason="stop",
+        ),
+        tokenizer=MagicMock(),
+    )
+
+    call_kwargs = serving.request_logger.log_outputs.call_args.kwargs
+    assert call_kwargs["output_token_ids"] is None
+    assert output_items[0].content[0].text == "Test output"
+
+
 @pytest.fixture
 def mock_serving_responses():
     """Create a mock OpenAIServingResponses instance"""

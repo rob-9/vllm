@@ -360,14 +360,16 @@ class ServingTokens(GenerateBaseServing):
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
+            log_token_ids = self.request_logger.enable_log_output_token_ids
             for choice in choices:
                 # Get the corresponding output token IDs
                 output_token_ids = None
-                if choice.index < len(final_res.outputs):
+                if log_token_ids and choice.index < len(final_res.outputs):
                     output_token_ids = final_res.outputs[choice.index].token_ids
 
-                if output_token_ids:
-                    # Log token_ids only.
+                # With ID logging enabled, keep legacy behavior of skipping
+                # empty-ID choices; with it disabled, still emit the record.
+                if output_token_ids or not log_token_ids:
                     self.request_logger.log_outputs(
                         request_id=request_id,
                         outputs="",

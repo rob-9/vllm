@@ -578,3 +578,62 @@ async def test_stream_prompt_tokens_details_zero_cached():
     # Zero cached tokens must be present, not omitted
     assert usage_chunk["usage"]["prompt_tokens_details"] is not None
     assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_full_generator_logs_outputs_when_token_ids_disabled():
+    """Disabling output-token-ID logging must not suppress the output log
+    record itself; finish_reason must still be logged."""
+    engine = _mock_engine()
+
+    async def mock_generate(*args, **kwargs):
+        yield _make_request_output(
+            "req-1", token_ids=[10], finish_reason="stop", finished=True
+        )
+
+    engine.generate = MagicMock(side_effect=mock_generate)
+    serving = _build_serving_tokens(engine, enable_log_outputs=True)
+    serving.request_logger = MagicMock()
+    serving.request_logger.enable_log_output_token_ids = False
+
+    request = GenerateRequest(
+        token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=1),
+        model=MODEL_NAME,
+        stream=False,
+    )
+
+    await serving.serve_tokens(request)
+
+    serving.request_logger.log_outputs.assert_called_once()
+    call_kwargs = serving.request_logger.log_outputs.call_args.kwargs
+    assert call_kwargs["finish_reason"] == "stop"
+    assert call_kwargs["output_token_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_full_generator_skips_empty_token_output_by_default():
+    """With ID logging enabled (default), a choice with zero generated
+    tokens produces no output log record, matching legacy behavior."""
+    engine = _mock_engine()
+
+    async def mock_generate(*args, **kwargs):
+        yield _make_request_output(
+            "req-1", token_ids=[], finish_reason="abort", finished=True
+        )
+
+    engine.generate = MagicMock(side_effect=mock_generate)
+    serving = _build_serving_tokens(engine, enable_log_outputs=True)
+    serving.request_logger = MagicMock()
+    serving.request_logger.enable_log_output_token_ids = True
+
+    request = GenerateRequest(
+        token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=1),
+        model=MODEL_NAME,
+        stream=False,
+    )
+
+    await serving.serve_tokens(request)
+
+    serving.request_logger.log_outputs.assert_not_called()

@@ -1058,7 +1058,11 @@ class OpenAIServingResponses(GenerateBaseServing):
             self.request_logger.log_outputs(
                 request_id=request.request_id,
                 outputs=final_output.text,
-                output_token_ids=final_output.token_ids,
+                output_token_ids=(
+                    final_output.token_ids
+                    if self.request_logger.enable_log_output_token_ids
+                    else None
+                ),
                 finish_reason=final_output.finish_reason,
                 is_streaming=False,
                 delta=False,

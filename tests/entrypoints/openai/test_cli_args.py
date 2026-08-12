@@ -214,6 +214,13 @@ def test_per_request_metrics_requires_log_stats(serve_parser):
         validate_parsed_serve_args(args)
 
 
+def test_log_output_token_ids_parsing(serve_parser):
+    assert serve_parser.parse_args([]).enable_log_output_token_ids
+    assert not serve_parser.parse_args(
+        ["--no-enable-log-output-token-ids"]
+    ).enable_log_output_token_ids
+
+
 @pytest.mark.parametrize(
     "cli_args, expected_middleware",
     [

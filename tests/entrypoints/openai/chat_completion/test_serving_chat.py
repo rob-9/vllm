@@ -742,6 +742,64 @@ async def test_chat_per_request_metrics_follow_server_flag():
 
 
 @pytest.mark.asyncio
+async def test_chat_output_logging_omits_token_ids_without_changing_response():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.enable_log_outputs = True
+    serving.request_logger = MagicMock()
+    serving.request_logger.enable_log_output_token_ids = False
+
+    response = await serving.chat_completion_full_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            return_token_ids=True,
+        ),
+        _single_request_output(_make_metrics_request_output()),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+
+    call_kwargs = serving.request_logger.log_outputs.call_args.kwargs
+    assert call_kwargs["output_token_ids"] is None
+    assert response.choices[0].token_ids == [100, 101]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_logging_omits_token_ids_without_changing_response():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.enable_log_outputs = True
+    serving.enable_log_deltas = True
+    serving.request_logger = MagicMock()
+    serving.request_logger.enable_log_output_token_ids = False
+
+    chunks = await _collect_metrics_stream_chunks(
+        serving,
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+            return_token_ids=True,
+        ),
+    )
+
+    log_calls = serving.request_logger.log_outputs.call_args_list
+    assert log_calls
+    assert all(call.kwargs["output_token_ids"] is None for call in log_calls)
+    token_id_choices = [
+        choice
+        for chunk in chunks
+        for choice in chunk["choices"]
+        if "token_ids" in choice
+    ]
+    assert token_id_choices[0]["token_ids"] == [100, 101]
+
+
+@pytest.mark.asyncio
 async def test_chat_per_request_metrics_suppressed_for_n_greater_than_one():
     serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=True)
     response = await serving.chat_completion_full_generator(
